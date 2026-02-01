@@ -2,17 +2,12 @@ import socketio
 import asyncio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from simulation import simulation  # Ensure simulation.py exists in the same folder
+from simulation import trip_manager
 
-# 1. Setup Socket.IO
 sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 app = FastAPI()
-
-# 2. Wrap FastAPI with Socket.IO
-# This is the 'socket_app' Uvicorn is looking for
 socket_app = socketio.ASGIApp(sio, app)
 
-# 3. CORS (Allow React to talk to Python)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,60 +16,47 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 4. Background Task: Simulation Loop
-async def simulation_loop():
+async def broadcast_loop():
     while True:
-        # Update car positions
-        simulation.update()
-        
-        # Send new positions to frontend
-        car_data = [car.to_dict() for car in simulation.cars]
-        await sio.emit('game_state', {'cars': car_data})
-        
-        # Wait 0.1s (10 FPS)
-        await asyncio.sleep(0.1)
+        drivers = trip_manager.get_all_drivers()
+        await sio.emit('drivers_update', drivers)
+        await asyncio.sleep(2)
 
 @app.on_event("startup")
 async def startup_event():
-    # Start the simulation loop in the background
-    asyncio.create_task(simulation_loop())
+    asyncio.create_task(broadcast_loop())
+
+@sio.event
+async def join_driver(sid, coords):
+    # Register with random gender for demo
+    import random
+    gender = "F" if random.random() > 0.5 else "M"
+    trip_manager.register_driver(sid, coords['lat'], coords['lng'], gender)
+    await sio.emit('login_success', {'role': 'driver'}, to=sid)
+
+@sio.event
+async def join_passenger(sid, coords):
+    await sio.emit('login_success', {'role': 'passenger'}, to=sid)
+
+@sio.event
+async def request_ride(sid, data):
+    p_lat, p_lng = data['pickup']['lat'], data['pickup']['lng']
+    d_lat, d_lng = data['drop']['lat'], data['drop']['lng']
+    safety = data.get('safety_mode', False) # New Flag
+    
+    result = trip_manager.request_ride(sid, p_lat, p_lng, d_lat, d_lng, safety)
+    
+    if result['found']:
+        await sio.emit('ride_confirmed', result, to=sid)
+        # Notify driver
+        await sio.emit('new_job', result, to=result['driver']['sid'])
+    else:
+        await sio.emit('ride_error', {'msg': 'No Drivers Available'}, to=sid)
+
+@sio.event
+async def verify_otp(sid, data):
+    if trip_manager.verify_otp(data['ride_id'], data['otp']):
+        await sio.emit('otp_success', {}, to=sid)
 
 @app.get("/")
-def read_root():
-    return {"message": "SwiftRoute Backend Online"}
-
-# --- Socket Events ---
-@sio.event
-async def connect(sid, environ):
-    print(f"Client Connected: {sid}")
-
-@sio.event
-async def disconnect(sid):
-    print(f"Client Disconnected: {sid}")
-
-@sio.event
-async def request_grid(sid):
-    # Send the static graph structure to the client
-    grid_data = simulation.get_graph_data()
-    await sio.emit('grid_data', grid_data, to=sid)
-
-# ... inside main.py ...
-
-@sio.event
-async def toggle_traffic(sid, data):
-    # data = {'u': node_id_1, 'v': node_id_2}
-    u, v = int(data['u']), int(data['v'])
-    
-    # Toggle weight: If 1 -> make it 20 (Jam). If > 1 -> make it 1 (Clear).
-    current_weight = simulation.get_graph_data()['edges'][u][v]
-    new_weight = 20 if current_weight == 1 else 1
-    
-    # 1. Update Graph
-    from graph import city_graph
-    city_graph.update_weight(u, v, new_weight)
-    
-    # 2. Tell cars to re-calculate paths
-    simulation.trigger_repath()
-    
-    # 3. Broadcast new grid to all clients (so the line turns Red)
-    await sio.emit('grid_data', simulation.get_graph_data())
+def read_root(): return {"status": "SwiftRoute Pro Backend"}
